@@ -7,7 +7,7 @@ from nipype.interfaces.io import SelectFiles, DataSink
 from nipype.interfaces.fsl import (
     IsotropicSmooth, Level1Design, FEATModel,
     L2Model, Merge, FLAMEO, FILMGLS, MultipleRegressDesign,
-    FSLCommand, Cluster, FLIRT, Info, ImageMaths
+    FSLCommand, Cluster, FLIRT, Info, ImageMaths, SmoothEstimate
     )
 from nipype.algorithms.modelgen import SpecifyModel
 from nipype.interfaces.fsl.maths import MultiImageMaths
@@ -191,83 +191,6 @@ class PipelineTeamO21U(Pipeline):
         run_level.connect(smoothing_func, 'out_file', model_estimate, 'in_file')
         run_level.connect(model_generation, 'con_file', model_estimate, 'tcon_file')
         run_level.connect(model_generation, 'design_file', model_estimate, 'design_file')
-        ################
-        # Nipype node
-        flt = MapNode(
-            interface=FLIRT(
-                cost="corratio",
-                dof=12,
-                searchr_x=[-90, 90],
-                searchr_y=[-90, 90],
-                searchr_z=[-90, 90],
-                interp="trilinear",
-            ),
-            name="example_func2standard",
-            iterfield=["in_file"],
-        )
-
-        flt.inputs.reference = Info.standard_image("MNI152_T1_2mm_brain.nii.gz")
-        ################
-        # Connecting the node in the workflow
-        run_level.connect(extract_ref, "roi_file", flt, "in_file")
-
-        def warp_files(copes, varcopes, masks, mat):
-            from nipype.interfaces import fsl
-
-            # need to reimport here, otherwise errors come out
-
-            out_copes = []
-            out_varcopes = []
-            out_masks = []
-
-            # register mask, same function, different parameters
-            warp_mask = fsl.FLIRT(apply_xfm=True, interp="nearestneighbour")
-            warp_mask.inputs.reference = Info.standard_image("MNI152_T1_2mm_brain.nii.gz")
-            warp_mask.inputs.in_matrix_file = mat
-            warp_mask.inputs.output_type = "NIFTI_GZ"
-            warp_mask.inputs.in_file = masks
-            res_mask = warp_mask.run()
-            out_masks.append(str(res_mask.outputs.out_file))
-
-            # register copes & varcopes using same function, different parameters
-            warp = fsl.FLIRT(apply_xfm=True, interp="trilinear")
-            warp.inputs.reference = fsl.Info.standard_image("MNI152_T1_2mm_brain.nii.gz")
-            warp.inputs.in_matrix_file = mat
-            warp.inputs.output_type = "NIFTI_GZ"
-
-            # register copes
-            for cope in copes:
-                warp.inputs.in_file = cope
-                res = warp.run()
-                out_copes.append(str(res.outputs.out_file))
-
-            # register varcopes
-            for varcope in varcopes:
-                warp.inputs.in_file = varcope
-                res = warp.run()
-                out_varcopes.append(str(res.outputs.out_file))
-
-            return out_copes, out_varcopes, out_masks
-
-
-            ################
-            # Nipype node
-        warpfunc = MapNode(Function(
-                    input_names=["copes", "varcopes", "masks", "mat"],
-                    output_names=["out_copes", "out_varcopes", "out_masks"],
-                    function=warp_files,
-                ),
-                iterfield=["copes", "varcopes", "masks", "mat"],
-                name="warpfunc",
-            )
-
-            ################
-            # Connecting the node in the workflow
-        run_level.connect(model_estimate, "copes", warpfunc, "copes")
-        run_level.connect(model_estimate, "varcopes", warpfunc, "varcopes")
-        run_level.connect(dilatemask, "out_file", warpfunc, "masks")
-        run_level.connect(flt, "out_matrix_file", warpfunc, "mat")
-
 
         # DataSink Node - store the wanted results in the wanted directory
         data_sink = Node(DataSink(), name = 'data_sink')
@@ -278,9 +201,7 @@ class PipelineTeamO21U(Pipeline):
             model_generation, 'design_file', data_sink, 'run_level_analysis.@design_file')
         run_level.connect(
             model_generation, 'design_image', data_sink, 'run_level_analysis.@design_img')
-        run_level.connect([(warpfunc, data_sink, [("out_copes", "reg_copes")])])
-        run_level.connect([(warpfunc, data_sink, [("out_varcopes", "reg_varcopes")])])
-        run_level.connect([(warpfunc, data_sink, [("out_masks", "reg_masks")])])
+        run_level.connect(model_design, "fsf_files", data_sink, "feat.fsf_files")
 
         # Remove large files, if requested
         if Configuration()['pipelines']['remove_unused_data']:
@@ -490,3 +411,515 @@ class PipelineTeamO21U(Pipeline):
         subject_level.connect(information_source, ("contr_id", int2string), datasink, "container")
         subject_level.connect([(level2estimate, datasink, [("stats_dir", "stats_dir")])])
         return subject_level
+
+    def get_subject_level_outputs(self):
+        """ Return the names of the files the subject level analysis is supposed to generate. """
+
+        parameters = {
+            'contrast_id' : self.contrast_list,
+            'subject_id' : self.subject_list,
+            'file' : ['cope1.nii.gz', 'tstat1.nii.gz', 'varcope1.nii.gz', 'zstat1.nii.gz']
+        }
+        parameter_sets = product(*parameters.values())
+        template = join(
+            self.directories.output_dir,
+            'subject_level_analysis', '_contrast_id_{contrast_id}_subject_id_{subject_id}','{file}'
+            )
+        return_list = [template.format(**dict(zip(parameters.keys(), parameter_values)))\
+            for parameter_values in parameter_sets]
+
+        parameters = {
+            'contrast_id' : self.contrast_list,
+            'subject_id' : self.subject_list,
+        }
+        parameter_sets = product(*parameters.values())
+        template = join(
+            self.directories.output_dir,
+            'subject_level_analysis', '_contrast_id_{contrast_id}_subject_id_{subject_id}',
+            'sub-{subject_id}_task-MGT_run-01_bold_space-MNI152NLin2009cAsym_brainmask_maths.nii.gz'
+            )
+        return_list += [template.format(**dict(zip(parameters.keys(), parameter_values)))\
+            for parameter_values in parameter_sets]
+
+        return return_list
+
+    def get_one_sample_t_test_regressors(subject_list: list) -> dict:
+        """
+        Create dictionary of regressors for one sample t-test group analysis.
+
+        Parameters:
+            - subject_list: ids of subject in the group for which to do the analysis
+
+        Returns:
+            - dict containing named lists of regressors.
+        """
+
+        return dict(group_mean = [1 for _ in subject_list])
+
+    def get_two_sample_t_test_regressors(
+        equal_range_ids: list,
+        equal_indifference_ids: list,
+        subject_list: list,
+        ) -> dict:
+        """
+        Create dictionary of regressors for two sample t-test group analysis.
+
+        Parameters:
+            - equal_range_ids: ids of subjects in equal range group
+            - equal_indifference_ids: ids of subjects in equal indifference group
+            - subject_list: ids of subject for which to do the analysis
+
+        Returns:
+            - regressors, dict: containing named lists of regressors.
+            - groups, list: group identifiers to distinguish groups in FSL analysis.
+        """
+
+        # Create 2 lists containing n_sub values which are
+        #  * 1 if the participant is on the group
+        #  * 0 otherwise
+        equal_range_regressors = [1 if i in equal_range_ids else 0 for i in subject_list]
+        equal_indifference_regressors = [
+            1 if i in equal_indifference_ids else 0 for i in subject_list
+            ]
+
+        # Create regressors output : a dict with the two list
+        regressors = dict(
+            equalRange = equal_range_regressors,
+            equalIndifference = equal_indifference_regressors
+        )
+
+        # Create groups outputs : a list with 1 for equalRange subjects and 2 for equalIndifference
+        groups = [1 if i == 1 else 2 for i in equal_range_regressors]
+
+        return regressors, groups
+
+    def get_group_level_analysis(self):
+        """
+        Return all workflows for the group level analysis.
+
+        Returns;
+            - a list of nipype.WorkFlow
+        """
+
+        methods = ['equalRange', 'equalIndifference', 'groupComp']
+        return [self.get_group_level_analysis_sub_workflow(method) for method in methods]
+
+    def get_group_level_analysis_sub_workflow(self, method):
+        """
+        Return a workflow for the group level analysis.
+
+        Parameters:
+            - method: one of 'equalRange', 'equalIndifference' or 'groupComp'
+
+        Returns:
+            - group_level: nipype.WorkFlow
+        """
+        # Compute the number of participants used to do the analysis
+        nb_subjects = len(self.subject_list)
+
+        # Declare the workflow
+        group_level = Workflow(
+            base_dir = self.directories.working_dir,
+            name = f'group_level_analysis_{method}_nsub_{nb_subjects}')
+
+        # Infosource Node - iterate over the contrasts generated by the subject level analysis
+        information_source = Node(IdentityInterface(
+            fields = ['contrast_id']),
+            name = 'information_source')
+        information_source.iterables = [('contrast_id', self.contrast_list)]
+
+        # SelectFiles Node - select necessary files
+        templates = {
+            'cope' : join(self.directories.output_dir,
+                'subject_level_analysis', '_contrast_id_{contrast_id}_subject_id_*',
+                'cope1.nii.gz'),
+            'varcope' : join(self.directories.output_dir,
+                'subject_level_analysis', '_contrast_id_{contrast_id}_subject_id_*',
+                'varcope1.nii.gz'),
+            'masks': join(self.directories.output_dir,
+                'subject_level_analysis', '_contrast_id_1_subject_id_*',
+                'sub-*_task-MGT_run-*_bold_space-MNI152NLin2009cAsym_brainmask_maths.nii.gz')
+            }
+        select_files = Node(SelectFiles(templates), name = 'select_files')
+        select_files.inputs.base_directory = self.directories.results_dir
+        group_level.connect(information_source, 'contrast_id', select_files, 'contrast_id')
+
+        ################
+        # Nipype node
+        copemerge = Node(
+            interface=Merge(dimension="t"), iterfield=["in_files"], name="copemerge"
+        )
+
+        ################
+        # FSL FEAT command line
+        # /usr/local/fsl/bin/fslmerge -t varcop (varcopes from all 26 inputs)
+
+        ################
+        # Nipype node
+        varcopemerge = Node(
+            interface=Merge(dimension="t"), iterfield=["in_files"], name="varcopemerge"
+        )
+
+        ################
+        # FSL FEAT command line
+        # /usr/local/fsl/bin/fslmerge -t mask (masks from all 26 inputs)
+
+        ################
+        # Nipype node
+        maskmerge = Node(
+            interface=Merge(dimension="t"), iterfield=["in_files"], name="maskmerge"
+        )
+
+
+        def repeat_mask(file):
+            n_sub = 26
+            import numpy as np
+
+            mask_lst = [file]
+            repeated = np.repeat(mask_lst, 26)
+            return list(repeated)
+
+
+        ################
+        # Connecting the node in the workflow
+        group_level.connect(select_files, "copes", copemerge, "in_files")
+        group_level.connect(select_files, "varcopes", varcopemerge, "in_files")
+        group_level.connect(select_files, ("masks", repeat_mask), maskmerge, "in_files")
+
+        minmask = Node(
+            interface=ImageMaths(op_string="-Tmin"), iterfield=["in_file"], name="minmask"
+        )
+
+        ################
+        # Connecting the node in the workflow
+        group_level.connect(maskmerge, "merged_file", minmask, "in_file")
+
+
+        ################
+        # FSL FEAT command line
+        # /usr/local/fsl/bin/fslmaths cope1 -mas mask cope1
+
+        ################
+        # Nipype node
+        maskcope = Node(
+            interface=ImageMaths(op_string="-mas"),
+            iterfield=["in_file", "in_file2"],
+            name="maskcope",
+        )
+
+        ################
+        # FSL FEAT command line
+        # /usr/local/fsl/bin/fslmaths varcope1 -mas mask varcope1
+
+        ################
+        # Nipype node
+        maskvarcope = Node(
+            interface=ImageMaths(op_string="-mas"),
+            iterfield=["in_file", "in_file2"],
+            name="maskvarcope",
+        )
+
+        ################
+        # Connecting the node in the workflow
+        group_level.connect(copemerge, "merged_file", maskcope, "in_file")
+        group_level.connect(minmask, "out_file", maskcope, "in_file2")
+        group_level.connect(varcopemerge, "merged_file", maskvarcope, "in_file")
+        group_level.connect(minmask, "out_file", maskvarcope, "in_file2")
+
+
+        def num_copes(files):
+            return len(files)
+
+
+        ################
+        # Nipype node
+        level3model = Node(interface=L2Model(), name="l3model")
+
+        ################
+        # Connecting the node in the workflow
+        group_level.connect(select_files, ("copes", num_copes), level3model, "num_copes")
+
+
+        ################
+        # Nipype node
+        level3estimate = Node(
+            interface=FLAMEO(run_mode="flame1"),
+            name="level3estimate",
+            iterfield=["cope_file", "var_cope_file"],
+        )
+
+        ################
+        # Connecting the node in the workflow
+        group_level.connect(
+            [
+                (maskcope, level3estimate, [("out_file", "cope_file")]),
+                (maskvarcope, level3estimate, [("out_file", "var_cope_file")]),
+                (minmask, level3estimate, [("out_file", "mask_file")]),
+                (
+                    level3model,
+                    level3estimate,
+                    [
+                        ("design_mat", "design_file"),
+                        ("design_con", "t_con_file"),
+                        ("design_grp", "cov_split_file"),
+                    ],
+                ),
+            ]
+        )
+
+
+        ################
+        # FSL FEAT command line
+        # /usr/local/fsl/bin/smoothest -d 25 -m mask -r stats/res4d > stats/smoothness
+
+        ################
+        # Nipype node
+        smoothest = Node(
+            interface=SmoothEstimate(dof=25),
+            name="smoothest",
+            iterfield=["residual_fit_file", "mask_file"],
+        )
+
+        ################
+        # Connecting the node in the workflow
+        group_level.connect(minmask, "out_file", smoothest, "mask_file")
+        group_level.connect(level3estimate, "res4d", smoothest, "residual_fit_file")
+
+        ################
+        # FSL FEAT command line
+        # /usr/local/fsl/bin/fslmaths stats/zstat1 -mas mask thresh_zstat1
+
+        ################
+        # Nipype node
+        level3mask = Node(
+            interface=ImageMaths(op_string="-mas"),
+            iterfield=["in_file", "in_file2"],
+            name="level3mask",
+        )
+
+        ################
+        # Connecting the node in the workflow
+        group_level.connect(
+            [
+                (level3estimate, level3mask, [("zstats", "in_file")]),
+                (minmask, level3mask, [("out_file", "in_file2")]),
+            ]
+        )
+
+        # Cluster Node - Perform clustering on statistical output
+        cluster = MapNode(
+            Cluster(),
+            name = 'cluster',
+            iterfield = ['in_file', 'cope_file'],
+            synchronize = True
+            )
+        cluster.inputs.threshold = 2.3
+        cluster.inputs.out_threshold_file = True
+        group_level.connect(level3estimate, 'zstats', cluster, 'in_file')
+        group_level.connect(level3estimate, 'copes', cluster, 'cope_file')
+
+        # Datasink Node - Save important files
+        data_sink = Node(DataSink(), name = 'data_sink')
+        data_sink.inputs.base_directory = self.directories.output_dir
+        group_level.connect(level3estimate, 'zstats', data_sink,
+            f'group_level_analysis_{method}_nsub_{nb_subjects}.@zstats')
+        group_level.connect(level3estimate, 'tstats', data_sink,
+            f'group_level_analysis_{method}_nsub_{nb_subjects}.@tstats')
+        group_level.connect(cluster,'threshold_file', data_sink,
+            f'group_level_analysis_{method}_nsub_{nb_subjects}.@threshold_file')
+
+        if method in ('equalIndifference', 'equalRange'):
+            # Setup a one sample t-test
+            level3model.inputs.contrasts = [
+                ['group_mean', 'T', ['group_mean'], [1]],
+                ['group_mean_neg', 'T', ['group_mean'], [-1]]
+                ]
+
+            # Function Node get_group_subjects - Get subjects in the group and in the subject_list
+            get_group_subjects = Node(Function(
+                function = list_intersection,
+                input_names = ['list_1', 'list_2'],
+                output_names = ['out_list']
+                ),
+                name = 'get_group_subjects'
+            )
+            get_group_subjects.inputs.list_1 = get_group(method)
+            get_group_subjects.inputs.list_2 = self.subject_list
+            group_level.connect(get_group_subjects, 'out_list', maskcope, 'elements')
+            group_level.connect(get_group_subjects, 'out_list', maskvarcope, 'elements')
+
+            # Function Node get_one_sample_t_test_regressors
+            #   Get regressors in the equalRange and equalIndifference method case
+            regressors_one_sample = Node(
+                Function(
+                    function = self.get_one_sample_t_test_regressors,
+                    input_names = ['subject_list'],
+                    output_names = ['regressors']
+                ),
+                name = 'regressors_one_sample',
+            )
+            group_level.connect(get_group_subjects, 'out_list', regressors_one_sample, 'subject_list')
+            group_level.connect(regressors_one_sample, 'regressors', level3model, 'regressors')
+
+        elif method == 'groupComp':
+
+            # Select copes and varcopes corresponding to the selected subjects
+            #   Indeed the SelectFiles node asks for all (*) subjects available
+            maskcope.inputs.elements = self.subject_list
+            maskcope.inputs.elements = self.subject_list
+
+            # Setup a two sample t-test
+            level3model.inputs.contrasts = [
+                ['equalRange_sup', 'T', ['equalRange', 'equalIndifference'], [1, -1]]
+            ]
+
+            # Function Node get_equal_range_subjects
+            #   Get subjects in the equalRange group and in the subject_list
+            get_equal_range_subjects = Node(Function(
+                function = list_intersection,
+                input_names = ['list_1', 'list_2'],
+                output_names = ['out_list']
+                ),
+                name = 'get_equal_range_subjects'
+            )
+            get_equal_range_subjects.inputs.list_1 = get_group('equalRange')
+            get_equal_range_subjects.inputs.list_2 = self.subject_list
+
+            # Function Node get_equal_indifference_subjects
+            #   Get subjects in the equalIndifference group and in the subject_list
+            get_equal_indifference_subjects = Node(Function(
+                function = list_intersection,
+                input_names = ['list_1', 'list_2'],
+                output_names = ['out_list']
+                ),
+                name = 'get_equal_indifference_subjects'
+            )
+            get_equal_indifference_subjects.inputs.list_1 = get_group('equalIndifference')
+            get_equal_indifference_subjects.inputs.list_2 = self.subject_list
+
+            # Function Node get_two_sample_t_test_regressors
+            #   Get regressors in the groupComp method case
+            regressors_two_sample = Node(
+                Function(
+                    function = self.get_two_sample_t_test_regressors,
+                    input_names = [
+                        'equal_range_ids',
+                        'equal_indifference_ids',
+                        'subject_list',
+                    ],
+                    output_names = ['regressors', 'groups']
+                ),
+                name = 'regressors_two_sample',
+            )
+            regressors_two_sample.inputs.subject_list = self.subject_list
+
+            # Add missing connections
+            group_level.connect(
+                get_equal_range_subjects, 'out_list', regressors_two_sample, 'equal_range_ids')
+            group_level.connect(
+                get_equal_indifference_subjects, 'out_list',
+                regressors_two_sample, 'equal_indifference_ids')
+            group_level.connect(regressors_two_sample, 'regressors', level3model, 'regressors')
+            group_level.connect(regressors_two_sample, 'groups', level3model, 'groups')
+
+        return group_level
+
+    def get_group_level_outputs(self):
+        """ Return all names for the files the group level analysis is supposed to generate. """
+
+        # Handle equalRange and equalIndifference
+        parameters = {
+            'contrast_id': self.contrast_list,
+            'method': ['equalRange', 'equalIndifference'],
+            'file': [
+                '_cluster0/zstat1_threshold.nii.gz',
+                '_cluster1/zstat2_threshold.nii.gz',
+                'tstat1.nii.gz',
+                'tstat2.nii.gz',
+                'zstat1.nii.gz',
+                'zstat2.nii.gz'
+                ]
+        }
+        parameter_sets = product(*parameters.values())
+        template = join(
+            self.directories.output_dir,
+            'group_level_analysis_{method}_nsub_'+f'{len(self.subject_list)}',
+            '_contrast_id_{contrast_id}',
+            '{file}'
+            )
+        return_list = [template.format(**dict(zip(parameters.keys(), parameter_values)))\
+            for parameter_values in parameter_sets]
+
+        # Handle groupComp
+        parameters = {
+            'contrast_id': self.contrast_list,
+            'file': [
+                '_cluster0/zstat1_threshold.nii.gz',
+                'tstat1.nii.gz',
+                'zstat1.nii.gz'
+                ]
+        }
+        parameter_sets = product(*parameters.values())
+        template = join(
+            self.directories.output_dir,
+            f'group_level_analysis_groupComp_nsub_{len(self.subject_list)}',
+            '_contrast_id_{contrast_id}',
+            '{file}'
+            )
+        return_list += [template.format(**dict(zip(parameters.keys(), parameter_values)))\
+            for parameter_values in parameter_sets]
+
+        return return_list
+
+    def get_hypotheses_outputs(self):
+        """ Return all hypotheses output file names. """
+
+        nb_sub = len(self.subject_list)
+        files = [
+            # Hypothesis 1
+            join(f'group_level_analysis_equalIndifference_nsub_{nb_sub}',
+                '_contrast_id_1', 'randomise_tfce_corrp_tstat2'),
+            join(f'group_level_analysis_equalIndifference_nsub_{nb_sub}',
+                '_contrast_id_1', 'zstat1.nii.gz'),
+            # Hypothesis 2
+            join(f'group_level_analysis_equalRange_nsub_{nb_sub}',
+                '_contrast_id_1', 'randomise_tfce_corrp_tstat2'),
+            join(f'group_level_analysis_equalRange_nsub_{nb_sub}',
+                '_contrast_id_1', 'zstat1.nii.gz'),
+            # Hypothesis 3
+            join(f'group_level_analysis_equalIndifference_nsub_{nb_sub}',
+                '_contrast_id_1', 'randomise_tfce_corrp_tstat2'),
+            join(f'group_level_analysis_equalIndifference_nsub_{nb_sub}',
+                '_contrast_id_1', 'zstat1.nii.gz'),
+            # Hypothesis 4
+            join(f'group_level_analysis_equalRange_nsub_{nb_sub}',
+                '_contrast_id_1', 'randomise_tfce_corrp_tstat2'),
+            join(f'group_level_analysis_equalRange_nsub_{nb_sub}',
+                '_contrast_id_1', 'zstat1.nii.gz'),
+            # Hypothesis 5
+            join(f'group_level_analysis_equalIndifference_nsub_{nb_sub}',
+                '_contrast_id_2', 'randomise_tfce_corrp_tstat1'),
+            join(f'group_level_analysis_equalIndifference_nsub_{nb_sub}',
+                '_contrast_id_2', 'zstat2.nii.gz'),
+            # Hypothesis 6
+            join(f'group_level_analysis_equalRange_nsub_{nb_sub}',
+                '_contrast_id_2', 'randomise_tfce_corrp_tstat1'),
+            join(f'group_level_analysis_equalRange_nsub_{nb_sub}',
+                '_contrast_id_2', 'zstat2.nii.gz'),
+            # Hypothesis 7
+            join(f'group_level_analysis_equalIndifference_nsub_{nb_sub}',
+                '_contrast_id_2', 'randomise_tfce_corrp_tstat1'),
+            join(f'group_level_analysis_equalIndifference_nsub_{nb_sub}',
+                '_contrast_id_2', 'zstat1.nii.gz'),
+            # Hypothesis 8
+            join(f'group_level_analysis_equalRange_nsub_{nb_sub}',
+                '_contrast_id_2', 'randomise_tfce_corrp_tstat1'),
+            join(f'group_level_analysis_equalRange_nsub_{nb_sub}',
+                '_contrast_id_2', 'zstat1.nii.gz'),
+            # Hypothesis 9
+            join(f'group_level_analysis_groupComp_nsub_{nb_sub}',
+                '_contrast_id_2', 'randomise_tfce_corrp_tstat1'),
+            join(f'group_level_analysis_groupComp_nsub_{nb_sub}',
+                '_contrast_id_2', 'zstat1.nii.gz')
+        ]
+        return [join(self.directories.output_dir, f) for f in files]
